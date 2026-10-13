@@ -1,4 +1,4 @@
-# ytgrab
+# ytGRAB
 
 A small desktop app for downloading videos and playlists, built on [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 Paste a link, see every available quality with its size, pick, download. It runs on Windows, macOS and Linux.
