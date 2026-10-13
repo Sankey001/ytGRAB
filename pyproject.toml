@@ -1,0 +1,51 @@
+[project]
+name = "ytgrab"
+version = "0.1.0"
+description = "A small desktop app for downloading videos and playlists with yt-dlp, on Windows, macOS and Linux"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Sankey001" }
+]
+requires-python = ">=3.10"
+keywords = ["yt-dlp", "video", "playlist", "downloader", "gui", "pyside6"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    # The window.
+    "pyside6-essentials>=6.7",
+    # The downloader, run as `python -m yt_dlp`.
+    "yt-dlp[default]>=2025.11.12",
+    # The JavaScript runtime yt-dlp needs for YouTube. No wheel exists for Windows on ARM,
+    # where a system-wide Deno or Node.js is picked up instead.
+    "deno>=2.6.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    # An ffmpeg binary, used when the system has none of its own.
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.gui-scripts]
+# gui-scripts rather than scripts: on Windows this starts without a console window.
+ytgrab = "ytgrab.app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.20,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

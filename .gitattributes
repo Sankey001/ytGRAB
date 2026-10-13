@@ -1,0 +1,6 @@
+# Same line endings in the repository whichever system a file was edited on.
+* text=auto eol=lf
+
+*.png  binary
+*.ico  binary
+*.icns binary
