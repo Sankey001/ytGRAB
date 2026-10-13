@@ -6,11 +6,13 @@ from ytgrab.ytdlp import (
     PROGRESS_TAG,
     Progress,
     download_cmd,
+    fragments_for,
     info_cmd,
     number_prefix,
     output_template,
     parse_progress,
     safe_name,
+    slim_info,
 )
 
 
@@ -101,3 +103,39 @@ def test_commands_do_not_depend_on_the_machine_they_run_on():
     name, path = tools.js_runtime()
     for built in (cmd, info_cmd("https://youtu.be/x")):
         assert built[built.index("--js-runtimes") + 1] == f"{name}:{path}"
+
+
+def test_fragment_budget_is_shared_between_videos():
+    assert fragments_for(1) == 32  # a video on its own gets the most
+    assert [fragments_for(n) for n in (2, 3, 4, 5, 6)] == [20, 13, 10, 8, 6]
+    assert fragments_for(40) == 6 and fragments_for(0) == 32  # never below the floor, never above the cap
+    assert all(fragments_for(n) * n <= 40 for n in range(2, 7))
+
+    cmd = download_cmd("https://youtu.be/x", "18", "out.%(ext)s", fragments=13)
+    assert cmd[cmd.index("--concurrent-fragments") + 1] == "13"
+
+
+def test_download_can_reuse_a_saved_lookup_instead_of_the_link():
+    by_link = download_cmd("https://youtu.be/x", "18", "out.%(ext)s")
+    from_file = download_cmd("https://youtu.be/x", "18", "out.%(ext)s", info_file="saved.json")
+    assert by_link[-1] == "https://youtu.be/x" and "--load-info-json" not in by_link
+    assert from_file[-2:] == ["--load-info-json", "saved.json"] and "https://youtu.be/x" not in from_file
+
+
+def test_slim_info_keeps_only_what_a_download_reads():
+    info = {
+        "id": "abc",
+        "title": "A talk",
+        "duration": 60,
+        "webpage_url": "https://youtu.be/abc",
+        "formats": [{"format_id": name, "url": name} for name in ("18", "137", "270", "234-20", "140")],
+        "thumbnails": [1, 2, 3],
+        "automatic_captions": {"en": []},
+        "subtitles": {},
+        "heatmap": [],
+        "requested_formats": [{"format_id": "137"}],
+    }
+    slim = slim_info(info, ["270+234-20", "18"])
+    assert [fmt["format_id"] for fmt in slim["formats"]] == ["18", "270", "234-20"]
+    assert set(slim) == {"id", "title", "duration", "webpage_url", "formats"}
+    assert len(info["formats"]) == 5  # the original is left alone

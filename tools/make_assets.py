@@ -1,10 +1,10 @@
-"""Regenerate the images in src/ytgrab/assets from code.
+"""Regenerate the app icon in src/ytgrab/assets from code.
 
     uv run python tools/make_assets.py
 
-The app icon is the mascot on the header's night-sky background, saved as
-PNG (Linux, window icon), ICO (Windows shortcut) and ICNS (macOS app bundle).
-Nothing here needs a display.
+The icon is the mascot on a deep green tile with a gold frame, in the Heritage
+theme's colours. It is saved as PNG (Linux, window icon), ICO (Windows
+shortcut) and ICNS (macOS app bundle). Nothing here needs a display.
 """
 
 from __future__ import annotations
@@ -14,54 +14,40 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPointF, QRectF, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPolygonF  # noqa: E402
+from PySide6.QtCore import QRectF, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QLinearGradient, QPainter, QPainterPath, QPen  # noqa: E402
 
+from ytgrab import theme  # noqa: E402
 from ytgrab.mascot import paint_mascot  # noqa: E402
+from ytgrab.theme import darken, mix  # noqa: E402
 
 ASSETS = Path(__file__).resolve().parent.parent / "src" / "ytgrab" / "assets"
 
 
-def canvas(size: int) -> QImage:
+def icon(size: int) -> QImage:
+    """A rounded tile in the header's colours, framed in gold, with the mascot standing in it."""
+    current = theme.select("heritage")
     image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(Qt.GlobalColor.transparent)
-    return image
-
-
-def icon(size: int) -> QImage:
-    """A rounded square in the header's colours with the mascot standing in it."""
-    image = canvas(size)
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    sky = QLinearGradient(0, 0, size, size)
-    sky.setColorAt(0.0, QColor("#121a30"))
-    sky.setColorAt(0.55, QColor("#1c3860"))
-    sky.setColorAt(1.0, QColor("#23607c"))
+    felt = QLinearGradient(0, 0, size, size)
+    felt.setColorAt(0.0, QColor(darken(current.band, 0.35)))
+    felt.setColorAt(0.55, QColor(current.band))
+    felt.setColorAt(1.0, QColor(mix(current.band, current.gold, 0.22)))
     tile = QPainterPath()
     tile.addRoundedRect(QRectF(0, 0, size, size), size * 0.22, size * 0.22)
-    painter.fillPath(tile, sky)
+    painter.fillPath(tile, felt)
 
-    figure = size * 0.86
-    painter.translate((size - figure) / 2, size * 0.09)
+    inset = size * 0.055
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(QColor(current.gold), max(1.0, size * 0.012)))
+    painter.drawRoundedRect(QRectF(inset, inset, size - inset * 2, size - inset * 2), size * 0.17, size * 0.17)
+
+    figure = size * 0.8
+    painter.translate((size - figure) / 2, size * 0.115)
     paint_mascot(painter, figure, "idle")
-    painter.end()
-    return image
-
-
-def tick(size: int = 32) -> QImage:
-    """The white tick shown inside a ticked checkbox."""
-    image = canvas(size)
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor("#ffffff"), size * 0.1375)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    unit = size / 32
-    painter.drawPolyline(
-        QPolygonF([QPointF(7.5 * unit, 16.5 * unit), QPointF(13.5 * unit, 22.5 * unit), QPointF(24.5 * unit, 10 * unit)])
-    )
     painter.end()
     return image
 
@@ -69,15 +55,9 @@ def tick(size: int = 32) -> QImage:
 def main() -> None:
     app = QGuiApplication([])  # noqa: F841 (Qt needs one to exist before it will paint)
     ASSETS.mkdir(parents=True, exist_ok=True)
-    outputs = {
-        "icon.png": icon(256),
-        "icon.ico": icon(256),
-        "icon.icns": icon(512),
-        "check.png": tick(),
-    }
-    for name, image in outputs.items():
+    for name, size in (("icon.png", 256), ("icon.ico", 256), ("icon.icns", 512)):
         target = ASSETS / name
-        if not image.save(str(target)):
+        if not icon(size).save(str(target)):
             raise SystemExit(f"could not write {target}")
         print(f"wrote {target.relative_to(ASSETS.parent.parent.parent)}  ({target.stat().st_size} bytes)")
 

@@ -1,8 +1,9 @@
-"""Shared test setup: Qt without a display, and settings kept away from the real ones."""
+"""Shared test setup: Qt without a display, no animation, and settings kept away from the real ones."""
 
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # must be set before Qt is imported
+os.environ.setdefault("YTGRAB_MOTION", "off")  # changes land at once, so nothing here depends on timing
 
 import pytest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -24,4 +25,5 @@ def isolated_settings(tmp_path, monkeypatch):
     """
     path = tmp_path / "settings.ini"
     monkeypatch.setenv("YTGRAB_SETTINGS", str(path))
+    monkeypatch.delenv("YTGRAB_THEME", raising=False)  # a developer's own choice must not decide the tests
     return path

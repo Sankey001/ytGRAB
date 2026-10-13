@@ -16,8 +16,18 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDir, QProcess, QProcessEnvironment, QSettings, QStandardPaths, Qt, QTimer, Signal
-from PySide6.QtGui import QFontDatabase, QIcon, QPixmap
+from PySide6.QtCore import (
+    QDir,
+    QProcess,
+    QProcessEnvironment,
+    QSettings,
+    QStandardPaths,
+    Qt,
+    QTemporaryDir,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -25,28 +35,23 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
     QScrollArea,
-    QSizePolicy,
-    QSpinBox,
-    QTableWidget,
+    QStyledItemDelegate,
     QTableWidgetItem,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from shiboken6 import isValid
 
-from ytgrab import __version__, launcher, theme, tools, ytdlp
+from ytgrab import __version__, dialogs, fonts, launcher, motion, theme, tools, ytdlp
 from ytgrab.eta import SpeedMeter
 from ytgrab.formats import (
     DEFAULT_HEIGHT,
@@ -60,37 +65,66 @@ from ytgrab.formats import (
 )
 from ytgrab.mascot import Mascot, SpeechBubble
 from ytgrab.urls import UrlKind, classify, normalize, split_links
+from ytgrab.widgets import (
+    Canvas,
+    Emblem,
+    FooterBand,
+    GoldBar,
+    HeaderBand,
+    HintedTable,
+    LuxButton,
+    Medallion,
+    OverallProgress,
+    Panel,
+    Pill,
+    RowRule,
+    RuledRow,
+    Stepper,
+    Text,
+    ThemePicker,
+)
 
-FETCH_PARALLEL = 4  # info lookups running at once
+# Lookups running at once when listing. Measured on a 9-video playlist:
+# 4 at once took about 7.5 s, 6 took 4.5 s, and 8 was no faster than 6.
+FETCH_PARALLEL = min(6, max(3, (os.cpu_count() or 4) // 2))
 DEFAULT_DOWNLOADS = 3  # videos downloading at once
 MIN_BYTES_FOR_SPEED = 5 * 1024 * 1024  # don't remember a speed measured on a tiny download
-CONTROL_HEIGHT = 34  # dropdowns and the spin box, to line up with the buttons
-ROW_HEIGHT = 38
-BODY_SPACING = 14  # gap between the cards
+SAVED_INFO_MAX_AGE = 4 * 3600  # seconds; the links inside a lookup's answer expire after some hours
+
+CONTROL_HEIGHT = theme.CONTROL_HEIGHT  # text fields, dropdowns and buttons share one height
+COMPACT_HEIGHT = theme.COMPACT_HEIGHT  # the same, where room is short: table rows, the options row
+PANEL_PADDING = 24  # between a panel's edge and what is in it
+ROW_HEIGHT = 48
+BODY_MARGINS = (30, 24, 30, 24)
+BODY_SPACING = 18  # gap between the panels
+LOG_HEIGHT = 120
 WINDOW_FRAME_ALLOWANCE = 48  # title bar and a little slack when sizing to the screen
 MAX_LINK_ROWS_SHOWN = 3  # more links than this scroll
+ROW_REVEAL_LIMIT = 24  # a longer list appears at once instead of unfolding row by row
 
 COL_PICK, COL_TITLE, COL_LENGTH, COL_QUALITY, COL_SIZE, COL_PROGRESS = range(6)
 HEADERS = ["#", "Title", "Length", "Quality", "Size", "Progress"]
 
-BADGE_COLORS = {
-    UrlKind.VIDEO: "#1a73e8",
-    UrlKind.PLAYLIST: "#8e24aa",
-    UrlKind.OTHER: "#5f6368",
-    UrlKind.INVALID: "#d93025",
+# The tag shown beside a link field, by what the link is.
+LINK_KINDS = {
+    UrlKind.VIDEO: "video",
+    UrlKind.PLAYLIST: "playlist",
+    UrlKind.OTHER: "other",
+    UrlKind.INVALID: "invalid",
 }
+FETCHABLE = (UrlKind.VIDEO, UrlKind.PLAYLIST, UrlKind.OTHER)
 
 # What the mascot shows and says for each situation: (mood, speech bubble).
 MOODS = {
-    "idle": ("idle", "Drop a link and I'll fetch it"),
+    "idle": ("idle", "At your service. Drop a link to begin."),
     "listing": ("busy", "Checking what's available…"),
-    "ready": ("idle", "Pick the qualities, then Download"),
+    "ready": ("idle", "Choose the qualities, then Download."),
     "downloading": ("busy", "Downloading…"),
-    "done": ("happy", "All done"),
-    "failed": ("sad", "Some downloads failed"),
-    "cancelled": ("idle", "Cancelled"),
-    "nothing": ("sad", "Nothing here can be downloaded"),
-    "missing": ("sad", "Something I need is missing"),
+    "done": ("happy", "All done."),
+    "failed": ("sad", "Some downloads failed."),
+    "cancelled": ("idle", "Cancelled."),
+    "nothing": ("sad", "Nothing here can be downloaded."),
+    "missing": ("sad", "Something I need is missing."),
 }
 
 
@@ -119,8 +153,11 @@ class Item:
     size: int = 0  # expected bytes for the chosen quality
     finished_files: int = 0  # bytes of streams already complete (video, then audio)
     current_file: int = 0  # bytes of the stream in progress
+    saved_info: dict | None = field(default=None, repr=False)  # the lookup's answer, kept for the download
+    saved_at: float = 0.0
+    saved_info_failed: bool = False
     combo: QComboBox | None = field(default=None, repr=False)
-    bar: QProgressBar | None = field(default=None, repr=False)
+    bar: GoldBar | None = field(default=None, repr=False)
 
     @property
     def received(self) -> int:
@@ -132,13 +169,14 @@ class Running:
     """A yt-dlp download process and the output we have not parsed yet."""
 
     item: Item
+    info_file: str = ""  # set when the download reuses the lookup's answer instead of asking again
     buffer: bytes = b""
     error: str = ""
     already_there: bool = False
 
 
 def open_settings() -> QSettings:
-    """The saved choices: folder, quality, speed of the last download.
+    """The saved choices: folder, quality, theme, speed of the last download.
 
     They live wherever the system keeps such things (the registry on Windows, a
     plist on macOS, ~/.config on Linux). YTGRAB_SETTINGS names an .ini file to
@@ -150,17 +188,40 @@ def open_settings() -> QSettings:
     return QSettings("ytgrab", "ytgrab")
 
 
-def _in_cell(widget: QWidget) -> QWidget:
-    """Wrap a widget so it keeps a little air inside its table cell."""
+def personal_icon() -> Path | None:
+    """Your own emblem, if you have put an icon.png in ytgrab's settings folder; it replaces the built-in one."""
+    override = os.environ.get("YTGRAB_SETTINGS")
+    if override:
+        folder = Path(override).parent
+    else:
+        folder = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppConfigLocation))
+    icon = folder / "icon.png"
+    return icon if icon.is_file() else None
+
+
+def _in_cell(widget: QWidget, vertical: int) -> QWidget:
+    """Wrap a widget so it keeps some air inside its table cell."""
     holder = QWidget()
     layout = QHBoxLayout(holder)
-    layout.setContentsMargins(6, 5, 6, 5)
+    layout.setContentsMargins(8, vertical, 8, vertical)
     layout.addWidget(widget)
     return holder
 
 
+def _dropdown() -> QComboBox:
+    """A QComboBox whose list obeys the stylesheet; with Qt's default delegate the list ignores item rules."""
+    combo = QComboBox()
+    combo.setItemDelegate(QStyledItemDelegate(combo))
+    return combo
+
+
+def _caption(text: str) -> Text:
+    """A small spaced-out label in capitals, for naming a control."""
+    return Text(text.upper(), fonts.sans(11, QFont.Weight.DemiBold, 1.4), "muted")
+
+
 class LinkRow(QWidget):
-    """A link field with a badge saying what the link is."""
+    """A link field with a tag saying what the link is."""
 
     changed = Signal()
     several_pasted = Signal(object, list)
@@ -168,18 +229,18 @@ class LinkRow(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setFixedHeight(CONTROL_HEIGHT)
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText("Paste or drop a video or playlist link")
-        self.badge = QLabel()
-        self.badge.setFixedSize(88, 26)
-        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.remove_button = QToolButton()
-        self.remove_button.setText("✕")
+        self.edit.setPlaceholderText("https://…")
+        self.edit.setMinimumHeight(CONTROL_HEIGHT)
+        self.badge = Pill()
+        self.remove_button = LuxButton("", "quiet", small=True, glyph="close")
+        self.remove_button.setAccessibleName("Remove this link")
         self.remove_button.setToolTip("Remove this link")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
         layout.addWidget(self.edit, 1)
         layout.addWidget(self.badge)
         layout.addWidget(self.remove_button)
@@ -200,11 +261,7 @@ class LinkRow(QWidget):
             self.several_pasted.emit(self, links)
             return
         kind = classify(text)
-        self.badge.setText(kind.value)
-        color = BADGE_COLORS.get(kind)
-        self.badge.setStyleSheet(
-            f"background:{color}; color:white; border-radius:13px; font-size:12px; font-weight:600;" if color else ""
-        )
+        self.badge.set_kind(LINK_KINDS.get(kind, ""), kind.value)
         self.changed.emit()
 
 
@@ -212,24 +269,29 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ytgrab")
-        available = self.screen().availableGeometry().height() - WINDOW_FRAME_ALLOWANCE
-        self.resize(1120, min(900, available))
         self.setAcceptDrops(True)
 
         self.settings = open_settings()
+        fonts.load()
+        theme.apply(QApplication.instance(), str(self.settings.value("theme", theme.AUTO)))
+
         self.items: list[Item] = []
         self.link_rows: list[LinkRow] = []
         self._mood = ""
         self._blocked = False  # a helper program is missing, so nothing can be fetched
         self._version_proc: QProcess | None = None
         self._height_before_log = 0  # window height to return to when the commands panel closes
+        self._links_height = 0
+        self._links_run = None
+        self._revealed = False
+        self._scratch = QTemporaryDir()  # holds the lookup answers handed back to yt-dlp; removed on exit
 
         # Info lookups: a bounded worker pool of yt-dlp processes.
         self._jobs: set[QProcess] = set()
         self._job_queue: deque[tuple[list[str], Callable[[bool, str, str], None]]] = deque()
         self._generation = 0  # bumped on every new listing, so late answers are dropped
 
-        # Downloads: a second pool, sized by the "Videos at once" box.
+        # Downloads: a second pool, sized by the "Videos at once" control.
         self._downloads: dict[QProcess, Running] = {}
         self._download_queue: deque[Item] = deque()
         self._batch: list[Item] = []
@@ -241,6 +303,11 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._tick)
 
         self._build_ui()
+        # No narrower than its contents need, so the body never has to scroll sideways on an ordinary screen.
+        screen = self.screen().availableGeometry()
+        needed = self.canvas.minimumSizeHint().width() + 16
+        self.setMinimumSize(min(needed, screen.width()), min(640, screen.height() - WINDOW_FRAME_ALLOWANCE))
+        self.resize(min(1240, screen.width() - 40), min(960, screen.height() - WINDOW_FRAME_ALLOWANCE))
         self._add_link_row()
         self._refresh_summary()
         self._refresh_free_space()
@@ -260,98 +327,94 @@ class MainWindow(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.log.setMaximumBlockCount(2000)
-        self.log.setFixedHeight(110)
+        self.log.setFixedHeight(LOG_HEIGHT)
         self.log.setVisible(False)
 
-        body = QVBoxLayout()
-        body.setContentsMargins(18, 16, 18, 16)
-        body.setSpacing(BODY_SPACING)
-        body.addWidget(self._build_links_card())
-        body.addWidget(self._build_folder_card())
-        body.addLayout(self._build_options_row())
-        body.addWidget(self._build_videos_card(), 1)
-        body.addWidget(self.log)
+        links_panel = self._build_links_panel()
+        folder_panel = self._build_folder_panel()
+        videos_panel = self._build_videos_panel()
+        top = QHBoxLayout()
+        top.setSpacing(BODY_SPACING)
+        top.addWidget(links_panel, 5)
+        top.addWidget(folder_panel, 4)
+
+        self.canvas = Canvas()
+        self._body = QVBoxLayout(self.canvas)
+        self._body.setContentsMargins(*BODY_MARGINS)
+        self._body.setSpacing(BODY_SPACING)
+        self._body.addLayout(top)
+        self._body.addWidget(self._build_preferences())
+        self._body.addWidget(videos_panel, 1)
+        self._body.addWidget(self.log)
+        self._panels = [links_panel, folder_panel, videos_panel]
+        for panel in self._panels:
+            self.canvas.add_panel(panel)
+
+        # The body scrolls if the window is ever too small for it, so nothing is cut off on a small screen.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.canvas)
 
         outer.addWidget(self._build_header())
-        outer.addLayout(body, 1)
+        outer.addWidget(scroll, 1)
         outer.addWidget(self._build_footer())
 
-    def _build_header(self) -> QFrame:
-        header = QFrame()
-        header.setObjectName("header")
-        header.setFixedHeight(92)
+    def _build_header(self) -> HeaderBand:
+        header = HeaderBand()
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(22, 0, 22, 0)
-        layout.setSpacing(14)
+        layout.setContentsMargins(BODY_MARGINS[0], 0, BODY_MARGINS[2], 1)
+        layout.setSpacing(18)
 
-        if theme.ICON_PATH.exists():
-            ratio = self.devicePixelRatioF()
-            pixmap = QPixmap(str(theme.ICON_PATH)).scaled(
-                int(56 * ratio),
-                int(56 * ratio),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            pixmap.setDevicePixelRatio(ratio)
-            logo = QLabel()
-            logo.setPixmap(pixmap)
-            layout.addWidget(logo)
-
-        title = QLabel("ytgrab")
-        title.setObjectName("appTitle")
-        tagline = QLabel("Download videos and playlists, at the quality you pick")
-        tagline.setObjectName("appTagline")
+        own_picture = personal_icon()
+        self.emblem = Emblem(str(own_picture) if own_picture else None)
+        title = Text("YTGRAB", fonts.display(27, 600, 8), "band_ink")
+        # elided, so a narrow window shortens the tagline with an ellipsis instead of slicing it
+        tagline = Text(
+            "Videos and playlists, at the quality you choose", fonts.serif(15, italic=True), "band_gold", elide=True
+        )
         titles = QVBoxLayout()
-        titles.setSpacing(2)
+        titles.setSpacing(1)
         titles.addStretch(1)
         titles.addWidget(title)
         titles.addWidget(tagline)
         titles.addStretch(1)
-        layout.addLayout(titles)
-        layout.addStretch(1)
 
         self.bubble = SpeechBubble()
-        self.mascot = Mascot(80)
+        self.mascot = Mascot(76)
+        layout.addWidget(self.emblem, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(titles, 1)
         layout.addWidget(self.bubble, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.mascot, 0, Qt.AlignmentFlag.AlignVCenter)
         return header
 
-    def _card(self, number: int, title: str, hint: str) -> tuple[QFrame, QVBoxLayout, QHBoxLayout]:
-        """A numbered section: the card, its content layout, and its heading row (for extras on the right)."""
-        card = QFrame()
-        card.setObjectName("card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 14, 18, 16)
-        layout.setSpacing(12)
-
-        step = QLabel(str(number))
-        step.setObjectName("stepNumber")
-        step.setFixedSize(26, 26)
-        step.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        name = QLabel(title)
-        name.setObjectName("stepTitle")
-        tip = QLabel(hint)
-        tip.setObjectName("stepHint")
+    def _panel(self, numeral: str, title: str, hint: str = "") -> tuple[Panel, QVBoxLayout, QHBoxLayout]:
+        """A numbered section: the panel, its content layout, and its heading row (for extras on the right)."""
+        panel = Panel()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(PANEL_PADDING, 20, PANEL_PADDING, PANEL_PADDING)
+        layout.setSpacing(16)
 
         heading = QHBoxLayout()
-        heading.setSpacing(10)
-        heading.addWidget(step)
-        heading.addWidget(name)
-        heading.addSpacing(4)
-        heading.addWidget(tip)
-        heading.addStretch(1)
+        heading.setSpacing(12)
+        heading.addWidget(Medallion(numeral))
+        heading.addWidget(Text(title.upper(), fonts.display(15, 600, 3.2), "ink"))
+        heading.addSpacing(2)
+        if hint:
+            heading.addWidget(Text(hint, fonts.serif(15, italic=True), "muted", elide=True), 1)
+        else:
+            heading.addStretch(1)
         layout.addLayout(heading)
-        return card, layout, heading
+        return panel, layout, heading
 
-    def _build_links_card(self) -> QFrame:
-        card, layout, heading = self._card(1, "Links", "Paste or drop video and playlist links")
-        self.add_button = QPushButton("+  Add another link")
+    def _build_links_panel(self) -> Panel:
+        panel, layout, heading = self._panel("I", "Links", "Paste or drop, as many as you like")
+        self.add_button = LuxButton("+ Add another link", "secondary", small=True)
         self.add_button.setToolTip("Add one more video or playlist to download alongside the others")
         self.add_button.clicked.connect(lambda: self._add_link_row().edit.setFocus())
         heading.addWidget(self.add_button)
 
         self.rows_host = QWidget()
-        self.rows_host.setObjectName("linkRows")
         self.rows_layout = QVBoxLayout(self.rows_host)
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
         self.rows_layout.setSpacing(8)
@@ -359,38 +422,41 @@ class MainWindow(QMainWindow):
         self.rows_scroll.setWidgetResizable(True)
         self.rows_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.rows_scroll.setWidget(self.rows_host)
-        self.rows_scroll.viewport().setAutoFillBackground(False)  # let the card show through
+        self.rows_scroll.viewport().setAutoFillBackground(False)  # let the panel show through
         self.rows_host.setAutoFillBackground(False)
         layout.addWidget(self.rows_scroll)
-        return card
+        layout.addStretch(1)
+        return panel
 
-    def _build_folder_card(self) -> QFrame:
-        card, layout, heading = self._card(2, "Download location", "Where the videos are saved")
-        self.space_label = QLabel()
-        self.space_label.setObjectName("muted")
+    def _build_folder_panel(self) -> Panel:
+        panel, layout, heading = self._panel("II", "Download location")
+        self.space_label = Text("", fonts.serif(15, italic=True), "muted")  # where the other panels have a hint
         heading.addWidget(self.space_label)
 
         default_folder = QDir.toNativeSeparators(
             QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
         )
         self.folder_edit = QLineEdit(str(self.settings.value("folder", default_folder)))
+        self.folder_edit.setMinimumHeight(CONTROL_HEIGHT)
         self.folder_edit.textChanged.connect(self._refresh_free_space)
-        self.browse_button = QPushButton("Browse…")
+        self.browse_button = LuxButton("Browse…", "secondary")
         self.browse_button.clicked.connect(self._browse)
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(10)
         row.addWidget(self.folder_edit, 1)
         row.addWidget(self.browse_button)
         layout.addLayout(row)
-        return card
+        layout.addStretch(1)
+        return panel
 
-    def _build_options_row(self) -> QHBoxLayout:
-        self.quality_all = QComboBox()
+    def _build_preferences(self) -> RuledRow:
+        self.quality_all = _dropdown()
         for height in STANDARD_HEIGHTS[:6]:
             self.quality_all.addItem(f"{height}p", height)
         saved_height = int(self.settings.value("height", DEFAULT_HEIGHT))
         self.quality_all.setCurrentIndex(max(self.quality_all.findData(saved_height), 0))
-        self.quality_all.setMinimumHeight(CONTROL_HEIGHT)
+        self.quality_all.setFixedHeight(COMPACT_HEIGHT)
+        self.quality_all.setMinimumWidth(100)
         self.quality_all.setToolTip("Applied to every video; a video without it gets the next one down")
         self.quality_all.currentIndexChanged.connect(self._apply_quality_to_all)
 
@@ -399,41 +465,42 @@ class MainWindow(QMainWindow):
         self.upgrade_check.setToolTip("Takes the 1440p version of a video whenever it is smaller than 300 MB")
         self.upgrade_check.toggled.connect(self._apply_quality_to_all)
 
-        self.parallel_spin = QSpinBox()
-        self.parallel_spin.setRange(1, 6)
-        self.parallel_spin.setValue(int(self.settings.value("parallel", DEFAULT_DOWNLOADS)))
-        self.parallel_spin.setMinimumHeight(CONTROL_HEIGHT)
+        self.parallel_spin = Stepper(1, 6, int(self.settings.value("parallel", DEFAULT_DOWNLOADS)))
         self.parallel_spin.setToolTip("How many videos download at the same time")
 
-        self.next_button = QPushButton("Next: show videos")
-        self.next_button.setProperty("primary", True)
+        self.next_button = LuxButton("Next: show videos", "primary")
         self.next_button.setDefault(True)
         self.next_button.clicked.connect(self.fetch)
 
-        def caption(text: str) -> QLabel:
-            label = QLabel(text)
-            label.setObjectName("optionLabel")
-            return label
-
-        row = QHBoxLayout()
-        row.setContentsMargins(4, 0, 0, 0)
+        # Between two hairlines, and inset like a panel's contents, so the row shares the panels' left and right edges.
+        strip = RuledRow()
+        row = QHBoxLayout(strip)
+        row.setContentsMargins(PANEL_PADDING, 14, PANEL_PADDING, 14)
         row.setSpacing(10)
-        row.addWidget(caption("Preferred quality"))
+        row.addWidget(_caption("Preferred quality"))
         row.addWidget(self.quality_all)
         row.addSpacing(6)
         row.addWidget(self.upgrade_check)
         row.addSpacing(14)
-        row.addWidget(caption("Videos at once"))
+        row.addWidget(_caption("Videos at once"))
         row.addWidget(self.parallel_spin)
         row.addStretch(1)
         row.addWidget(self.next_button)
-        return row
+        return strip
 
-    def _build_videos_card(self) -> QFrame:
-        card, layout, _heading = self._card(3, "Videos", "Every available quality with its size; tick the ones you want")
+    def _build_videos_panel(self) -> Panel:
+        panel, layout, _heading = self._panel(
+            "III", "Videos", "Every available quality with its size; tick the ones you want"
+        )
 
-        self.table = QTableWidget(0, len(HEADERS))
-        self.table.setHorizontalHeaderLabels(HEADERS)
+        self.table = HintedTable(
+            0, len(HEADERS), "Your videos will appear here", "Each with every quality on offer, and what it weighs"
+        )
+        self.table.setHorizontalHeaderLabels([name.upper() for name in HEADERS])
+        self.table.setFont(fonts.sans(14, tabular=True))  # equal-width figures: lengths and sizes line up
+        self.table.setItemDelegate(RowRule(self.table, loud=COL_TITLE))
+        self.table.setFrameShape(QFrame.Shape.NoFrame)
+        self.table.viewport().setAutoFillBackground(False)  # let the panel show through
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.table.setMinimumHeight(ROW_HEIGHT * 3)  # never squeezed below the header and two rows
@@ -441,86 +508,129 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         header = self.table.horizontalHeader()
+        header.setFixedHeight(40)
+        # Per heading rather than in the stylesheet (which cannot space letters) or on the header
+        # (whose own font the stylesheet resets): these then match the other small capitals.
+        for column in range(len(HEADERS)):
+            self.table.horizontalHeaderItem(column).setFont(fonts.sans(11, QFont.Weight.DemiBold, 1.4))
         header.setHighlightSections(False)
+        header.setSectionsClickable(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setSectionResizeMode(COL_TITLE, QHeaderView.ResizeMode.Stretch)
-        for column, width in ((COL_PICK, 58), (COL_LENGTH, 80), (COL_QUALITY, 172), (COL_SIZE, 90), (COL_PROGRESS, 164)):
+        for column, width in ((COL_PICK, 70), (COL_LENGTH, 92), (COL_QUALITY, 204), (COL_SIZE, 104), (COL_PROGRESS, 184)):
             self.table.setColumnWidth(column, width)
         self.table.itemChanged.connect(lambda _item: self._refresh_summary())
         layout.addWidget(self.table, 1)
 
-        self.summary = self._status_label()
-        self.download_button = QPushButton("Download")
-        self.download_button.setProperty("primary", True)
+        self.summary = Text("", fonts.sans(14), "ink", elide=True)  # a long line is cut short, never widens the window
+        self.download_button = LuxButton("Download", "primary")
         self.download_button.clicked.connect(self.start_downloads)
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = LuxButton("Cancel", "secondary")
         self.cancel_button.setEnabled(False)
+        self.cancel_button.setVisible(False)  # one action shows at a time: Download, or Cancel while it runs
         self.cancel_button.clicked.connect(self.cancel_downloads)
         actions = QHBoxLayout()
-        actions.setSpacing(10)
+        actions.setSpacing(12)
         actions.addWidget(self.summary, 1)
         actions.addWidget(self.download_button)
         actions.addWidget(self.cancel_button)
         layout.addLayout(actions)
 
         # Overall progress and time left: shown from the first download on
-        self.overall = QProgressBar()
-        self.overall.setObjectName("overall")
-        self.overall.setRange(0, 1000)
-        self.overall.setValue(0)
-        self.overall.setTextVisible(False)
-        self.eta_label = self._status_label()
-        self.eta_label.setObjectName("muted")
-        self.progress_box = QWidget()
-        progress = QVBoxLayout(self.progress_box)
-        progress.setContentsMargins(0, 0, 0, 0)
-        progress.setSpacing(8)
-        progress.addWidget(self.overall)
-        progress.addWidget(self.eta_label)
+        self.overall = OverallProgress()
+        self.eta_label = self.overall.caption
+        self.progress_box = self.overall
         self.progress_box.setVisible(False)
         layout.addWidget(self.progress_box)
-        return card
+        return panel
 
-    @staticmethod
-    def _status_label() -> QLabel:
-        """A one-line label that may be narrower than its text, so long status lines never widen the window."""
-        label = QLabel()
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        label.setMinimumWidth(120)
-        return label
-
-    def _build_footer(self) -> QFrame:
-        footer = QFrame()
-        footer.setObjectName("footer")
-        footer.setFixedHeight(40)
-        self.tools_label = QLabel()
-        self.log_toggle = QToolButton()
-        self.log_toggle.setText("Show commands")
+    def _build_footer(self) -> FooterBand:
+        footer = FooterBand()
+        self.tools_label = Text("", fonts.sans(12), "muted", elide=True)  # shortened rather than run into its neighbours
+        self.theme_picker = ThemePicker()
+        self.theme_picker.set_current(theme.current().key)
+        self.theme_picker.chosen.connect(self.set_theme)
+        self.menu_button = LuxButton(f"Add to {launcher.menu_name()}", "quiet", small=True)
+        self.menu_button.setToolTip("Create a launcher, so ytgrab can be started like any other app")
+        self.menu_button.clicked.connect(self._add_to_menu)
+        self.log_toggle = LuxButton("Show commands", "quiet", small=True)
         self.log_toggle.setToolTip("Show the yt-dlp commands ytgrab runs for you")
         self.log_toggle.setCheckable(True)
         self.log_toggle.toggled.connect(self._toggle_log)
+
         layout = QHBoxLayout(footer)
-        layout.setContentsMargins(22, 0, 14, 0)
-        self.menu_button = QToolButton()
-        self.menu_button.setText(f"Add to {launcher.menu_name()}")
-        self.menu_button.setToolTip("Create a launcher, so ytgrab can be started like any other app")
-        self.menu_button.clicked.connect(self._add_to_menu)
-        layout.addWidget(self.tools_label)
-        layout.addStretch(1)
+        layout.setContentsMargins(BODY_MARGINS[0], 0, BODY_MARGINS[2] - 10, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.tools_label, 1)
+        layout.addSpacing(12)
+        layout.addWidget(_caption("Theme"))
+        layout.addSpacing(4)
+        layout.addWidget(self.theme_picker)
+        layout.addSpacing(16)
         layout.addWidget(self.menu_button)
         layout.addWidget(self.log_toggle)
         return footer
+
+    # ---------------------------------------------------------- look and feel
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        if not self._revealed:
+            self._revealed = True
+            self._reveal()
+
+    def _reveal(self) -> None:
+        """As the window opens, the panels fade in one after another and settle upwards."""
+        for order, panel in enumerate(self._panels):
+            motion.fade_in(panel, 520, delay=110 * order, on_frame=self.canvas.update)
+        left, top, right, bottom = BODY_MARGINS
+
+        def settle(drop: float) -> None:
+            self._body.setContentsMargins(left, top + round(drop), right, bottom - round(drop))
+
+        motion.animate(self, 14.0, 0.0, 620, settle)
+
+    def set_theme(self, key: str) -> None:
+        """Switch to a theme chosen in the footer, and remember it."""
+        self.settings.setValue("theme", key)
+        self._restyle()
+
+    def follow_system(self) -> None:
+        """The system switched between light and dark: follow it, unless a theme was chosen by hand."""
+        if str(self.settings.value("theme", theme.AUTO)) not in theme.THEMES:
+            self._restyle()
+
+    def _restyle(self) -> None:
+        veil = None
+        if motion.enabled() and self.isVisible():
+            # A picture of the old look laid over the window and faded away, so the change is not a hard cut.
+            veil = QLabel(self)
+            veil.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            veil.setPixmap(self.grab())
+            veil.setGeometry(self.rect())
+            veil.show()
+            veil.raise_()
+
+        theme.apply(QApplication.instance(), str(self.settings.value("theme", theme.AUTO)))
+        for label in self.findChildren(Text):
+            label.retint()
+        self.theme_picker.set_current(theme.current().key)
+        self.update()
+
+        if veil is not None:
+            effect = QGraphicsOpacityEffect(veil)
+            veil.setGraphicsEffect(effect)
+            motion.animate(veil, 1.0, 0.0, 420, effect.setOpacity, on_done=veil.deleteLater)
 
     def _add_to_menu(self) -> None:
         try:
             where = launcher.install()
         except (OSError, KeyError, subprocess.SubprocessError) as error:
-            QMessageBox.warning(self, "ytgrab", f"Could not add ytgrab to the {launcher.menu_name()}.\n\n{error}")
+            dialogs.tell(self, "That did not work", f"ytgrab could not be added to the {launcher.menu_name()}.\n\n{error}", "sad")
             return
-        QMessageBox.information(self, "ytgrab", f"ytgrab is now in your {launcher.menu_name()}.\n\n{where}")
+        dialogs.tell(self, "Added", f"ytgrab is now in your {launcher.menu_name()}.\n\n{where}", "happy")
 
     def _toggle_log(self, shown: bool) -> None:
         self.log_toggle.setText("Hide commands" if shown else "Show commands")
@@ -531,15 +641,12 @@ class MainWindow(QMainWindow):
             self.log.setVisible(True)
             if resizable:
                 limit = self.screen().availableGeometry().height() - WINDOW_FRAME_ALLOWANCE
-                wanted = self._height_before_log + self.log.height() + BODY_SPACING
+                wanted = self._height_before_log + LOG_HEIGHT + BODY_SPACING
                 self.resize(self.width(), max(self._height_before_log, min(wanted, limit)))
         else:
             self.log.setVisible(False)
             height, self._height_before_log = self._height_before_log, 0
             if resizable and height:
-                # The layouts must first forget the panel's height, or the resize is clamped to the old minimum.
-                self.centralWidget().layout().activate()
-                self.layout().activate()
                 self.resize(self.width(), height)
 
     def _set_mood(self, name: str) -> None:
@@ -554,7 +661,7 @@ class MainWindow(QMainWindow):
         while not path.exists() and path != path.parent:
             path = path.parent  # a folder that will be created: measure the drive it will land on
         try:
-            self.space_label.setText(f"{human_size(shutil.disk_usage(path).free)} free on this drive")
+            self.space_label.setText(f"{human_size(shutil.disk_usage(path).free)} free")
         except OSError:
             self.space_label.clear()
 
@@ -635,13 +742,21 @@ class MainWindow(QMainWindow):
                 self._add_link_row(link)
 
     def _refresh_link_area(self) -> None:
-        # Grow with the rows, then scroll.
+        """The link list grows with its rows, easing to the new height, then scrolls."""
         shown = min(len(self.link_rows), MAX_LINK_ROWS_SHOWN)
-        if shown:
-            row_height = self.link_rows[0].sizeHint().height()
-            self.rows_scroll.setFixedHeight(row_height * shown + self.rows_layout.spacing() * (shown - 1))
+        height = CONTROL_HEIGHT * shown + self.rows_layout.spacing() * max(shown - 1, 0)
+        if height == self._links_height:
+            return
+        start, self._links_height = self._links_height, height
+        motion.stop(self._links_run)
+        if start and self.isVisible():
+            self._links_run = motion.animate(
+                self.rows_scroll, start, height, 200, lambda value: self.rows_scroll.setFixedHeight(round(value))
+            )
+        else:
+            self.rows_scroll.setFixedHeight(height)
 
-    def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasUrls() or event.mimeData().hasText():
             event.acceptProposedAction()
 
@@ -714,8 +829,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------ listing (Next)
 
     def fetch(self) -> None:
-        links = list(dict.fromkeys(row.link() for row in self.link_rows if row.kind() in BADGE_COLORS))
-        links = [link for link in links if classify(link) is not UrlKind.INVALID]
+        links = list(dict.fromkeys(row.link() for row in self.link_rows if row.kind() in FETCHABLE))
         if not links:
             self.summary.setText("Add at least one video or playlist link first.")
             return
@@ -726,13 +840,13 @@ class MainWindow(QMainWindow):
             proc.kill()
         self.items.clear()
         self.table.setRowCount(0)
-        self.overall.setValue(0)
+        self.overall.set_progress(0.0, "idle")
         self.eta_label.clear()
         self.progress_box.setVisible(False)
 
-        for link in links:
+        for order, link in enumerate(links):
             if classify(link) is UrlKind.VIDEO:
-                item = self._add_item(link, link)
+                item = self._add_item(link, link, reveal=order)
                 self._queue_job(ytdlp.info_cmd(link), partial(self._on_info, item))
             else:
                 self._queue_job(ytdlp.list_cmd(link), partial(self._on_listing, link))
@@ -747,18 +861,25 @@ class MainWindow(QMainWindow):
             return
 
         if data.get("_type") != "playlist":  # a non-YouTube link that turned out to be one video
-            self._apply_info(self._add_item(link, link), data)
+            self._apply_info(self._add_item(link, link, reveal=0), data)
             return
 
         # Two-phase fetch: the listing above was cheap, now fill in formats per video.
         # Numbers are the true playlist positions, so files keep their order even if an entry is missing.
         entries = data.get("entries") or []
+        unfold = len(entries) <= ROW_REVEAL_LIMIT
         for index, entry in enumerate(entries, start=1):
             if not entry:
                 continue
             url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry.get('id')}"
             item = self._add_item(
-                url, entry.get("title") or url, entry.get("duration"), data.get("title"), index, len(entries)
+                url,
+                entry.get("title") or url,
+                entry.get("duration"),
+                data.get("title"),
+                index,
+                len(entries),
+                reveal=index - 1 if unfold else None,
             )
             self._queue_job(ytdlp.info_cmd(url), partial(self._on_info, item))
         if not any(entries):
@@ -774,7 +895,10 @@ class MainWindow(QMainWindow):
         else:
             self._mark_unavailable(item, self._error_line(err))
 
-    def _add_item(self, url, title, duration=None, playlist=None, index=None, count=None) -> Item:
+    def _add_item(
+        self, url, title, duration=None, playlist=None, index=None, count=None, reveal: int | None = None
+    ) -> Item:
+        """Add a table row. `reveal` (its place in the batch) makes the row unfold a moment after the one before."""
         row = self.table.rowCount()
         item = Item(url=url, title=title, row=row, duration=duration, playlist=playlist, index=index, count=count)
         self.items.append(item)
@@ -790,36 +914,37 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_SIZE, QTableWidgetItem("…"))
         self.table.blockSignals(False)
 
-        item.combo = QComboBox()
+        item.combo = _dropdown()
         item.combo.addItem("Checking qualities…")
         item.combo.setEnabled(False)
         item.combo.currentIndexChanged.connect(partial(self._on_quality_changed, item))
-        self.table.setCellWidget(row, COL_QUALITY, _in_cell(item.combo))
+        item.combo.setFixedHeight(COMPACT_HEIGHT)
+        self.table.setCellWidget(row, COL_QUALITY, _in_cell(item.combo, (ROW_HEIGHT - COMPACT_HEIGHT) // 2))
 
-        item.bar = QProgressBar()
-        item.bar.setRange(0, 100)
-        item.bar.setValue(0)
-        item.bar.setFormat("")
-        self.table.setCellWidget(row, COL_PROGRESS, _in_cell(item.bar))
+        item.bar = GoldBar()
+        self.table.setCellWidget(row, COL_PROGRESS, _in_cell(item.bar, (ROW_HEIGHT - GoldBar.HEIGHT) // 2))
+
+        if reveal is not None and motion.enabled() and self.isVisible():
+
+            def grow(value: float) -> None:
+                if item.row < self.table.rowCount():
+                    self.table.setRowHeight(item.row, round(value))
+
+            motion.animate(item.bar, 0.0, ROW_HEIGHT, 280, grow, delay=30 * reveal)
         return item
 
     def _combo(self, item: Item) -> QComboBox:
         return item.combo
 
-    def _bar(self, item: Item) -> QProgressBar:
+    def _bar(self, item: Item) -> GoldBar:
         return item.bar
 
-    def _set_bar(self, item: Item, text: str, percent: int | None = None, tip: str = "", state: str = "") -> None:
-        """`state` picks the bar's colours: '' normal, 'done' green, 'failed' red text."""
-        bar = item.bar
-        if percent is not None:
-            bar.setValue(percent)
-        bar.setFormat(text)
-        bar.setToolTip(tip)
-        if (bar.property("state") or "") != state:
-            bar.setProperty("state", state)
-            bar.style().unpolish(bar)  # re-read the stylesheet for the new state
-            bar.style().polish(bar)
+    def _set_bar(
+        self, item: Item, text: str, fraction: float | None = None, state: str = "idle", tip: str = ""
+    ) -> None:
+        """Update a row's progress bar. States: 'idle', 'active' (shimmers), 'done', 'failed'."""
+        item.bar.set_progress(fraction, text, state)
+        item.bar.setToolTip(tip)
 
     def _upgrade_small(self) -> bool:
         return self.upgrade_check.isChecked()
@@ -832,6 +957,10 @@ class MainWindow(QMainWindow):
         item.title = info.get("title") or item.title
         item.duration = info.get("duration") or item.duration
         item.state = State.READY
+        # Keep what the site just told us, so the download need not ask again.
+        item.saved_info = ytdlp.slim_info(info, [option.format_spec for option in item.options])
+        item.saved_at = time.monotonic()
+        item.saved_info_failed = False
 
         self.table.item(item.row, COL_TITLE).setText(item.title)
         self.table.item(item.row, COL_TITLE).setToolTip(item.title)
@@ -861,7 +990,7 @@ class MainWindow(QMainWindow):
         self.table.item(item.row, COL_PICK).setFlags(Qt.ItemFlag.NoItemFlags)
         self.table.item(item.row, COL_SIZE).setText("–")
         self.table.blockSignals(False)
-        self._set_bar(item, "Unavailable", 0, reason)
+        self._set_bar(item, "Unavailable", 0.0, tip=reason)
         self._refresh_summary()
 
     def _chosen(self, item: Item) -> Quality:
@@ -922,7 +1051,7 @@ class MainWindow(QMainWindow):
         try:
             folder.mkdir(parents=True, exist_ok=True)
         except OSError as error:
-            QMessageBox.warning(self, "ytgrab", f"Can't use this folder:\n{folder}\n\n{error}")
+            dialogs.tell(self, "That folder can't be used", f"{folder}\n\n{error}", "sad")
             return
         self.settings.setValue("folder", str(folder))
         self.settings.setValue("parallel", self.parallel_spin.value())
@@ -934,7 +1063,7 @@ class MainWindow(QMainWindow):
             item.state = State.QUEUED
             item.size = self._chosen(item).size or 0
             item.finished_files = item.current_file = 0
-            self._set_bar(item, "Waiting", 0)
+            self._set_bar(item, "Waiting", 0.0)
 
         self._download_queue = deque(self._batch)
         self._cancelling = False
@@ -942,7 +1071,7 @@ class MainWindow(QMainWindow):
         self._started_at = time.monotonic()
         self.summary.setText(f"Downloading {len(self._batch)} of {len(self.items)} videos")
         self._set_mood("downloading")
-        self.overall.setValue(0)
+        self.overall.set_progress(0.0, "active")
         self.progress_box.setVisible(True)
         self._set_busy(True)
         self._timer.start()
@@ -956,6 +1085,8 @@ class MainWindow(QMainWindow):
         ):  # fmt: skip
             widget.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
+        self.download_button.setVisible(not busy)
+        self.cancel_button.setVisible(busy)
         for item in self.items:
             if item.state in (State.READY, State.QUEUED):
                 item.combo.setEnabled(not busy)
@@ -966,12 +1097,27 @@ class MainWindow(QMainWindow):
         if self._batch and not self._downloads and not self._download_queue:
             self._finish_batch()
 
+    def _save_info_for(self, item: Item) -> str | None:
+        """Write the lookup's answer to a file yt-dlp can read back, if it is still fresh enough to trust."""
+        fresh = time.monotonic() - item.saved_at < SAVED_INFO_MAX_AGE
+        if not item.saved_info or item.saved_info_failed or not fresh or not self._scratch.isValid():
+            return None
+        path = os.path.join(self._scratch.path(), f"video-{item.row}.json")
+        try:
+            Path(path).write_text(json.dumps(item.saved_info), encoding="utf-8")
+        except OSError:
+            return None
+        return path
+
     def _start_download(self, item: Item) -> None:
         quality = self._chosen(item)
         template = ytdlp.output_template(
             self.settings.value("folder"), quality.label, item.playlist, item.index, item.count
         )
-        cmd = ytdlp.download_cmd(item.url, quality.format_spec, template)
+        # Videos running together share one budget of connections; a video on its own gets the most.
+        sharing = min(self.parallel_spin.value(), len(self._downloads) + 1 + len(self._download_queue))
+        info_file = self._save_info_for(item)
+        cmd = ytdlp.download_cmd(item.url, quality.format_spec, template, ytdlp.fragments_for(sharing), info_file)
 
         proc = self._spawn(cmd)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -986,9 +1132,11 @@ class MainWindow(QMainWindow):
             if error == QProcess.ProcessError.FailedToStart
             else None
         )
-        self._downloads[proc] = Running(item)
+        self._downloads[proc] = Running(item, info_file or "")
         item.state = State.DOWNLOADING
-        self._set_bar(item, "Starting…", 0)
+        self._set_bar(item, "Starting…", None, "active")
+        if len(self._downloads) == 1:  # bring the working row into view, unless others are already being watched
+            self.table.scrollToItem(self.table.item(item.row, COL_TITLE), QAbstractItemView.ScrollHint.EnsureVisible)
         proc.start(*self._split(cmd))
 
     def _on_download_output(self, proc: QProcess) -> None:
@@ -1008,13 +1156,13 @@ class MainWindow(QMainWindow):
             item.current_file = max(item.current_file, progress.downloaded)
             # Trust the listed size; yt-dlp's running total for HLS swings too much to use.
             item.size = max(item.size, item.received)
-            percent = int(item.received * 100 / item.size) if item.size else 0
-            self._set_bar(item, f"{min(percent, 99)}%", min(percent, 99))
+            percent = min(int(item.received * 100 / item.size) if item.size else 0, 99)
+            self._set_bar(item, f"{percent}%", percent / 100, "active")
         elif line.startswith("[download] Destination:"):  # next stream (video, then audio) begins
             item.finished_files += item.current_file
             item.current_file = 0
         elif line.startswith("[Merger]"):
-            self._set_bar(item, "Merging…", 99)
+            self._set_bar(item, "Merging…", 0.99, "active")
         elif "has already been downloaded" in line:
             running.already_there = True
         elif line.startswith("ERROR"):
@@ -1031,21 +1179,34 @@ class MainWindow(QMainWindow):
             self._on_download_line(running, running.buffer.decode("utf-8", "replace").strip())
         proc.deleteLater()
         item = running.item
+        if running.info_file:
+            try:
+                os.remove(running.info_file)
+            except OSError:
+                pass
 
         if ok:
             item.state = State.DONE
             item.size = item.received  # the real figure replaces the estimate
-            self._set_bar(item, "Already downloaded" if running.already_there else "Done", 100, state="done")
+            self._set_bar(item, "Already downloaded" if running.already_there else "Done", 1.0, "done")
             self.table.blockSignals(True)
             self.table.item(item.row, COL_PICK).setFlags(Qt.ItemFlag.NoItemFlags)
             self.table.blockSignals(False)
             item.combo.setEnabled(False)
+        elif running.info_file and not self._cancelling:
+            # The saved answer did not work, most likely because its links have expired.
+            # Ask the site again; whatever was already downloaded is kept and resumed.
+            item.saved_info_failed = True
+            item.finished_files = item.current_file = 0
+            self.log.appendPlainText(f"{item.title}: the saved details no longer worked, looking the video up again")
+            self._start_download(item)
+            return
         else:
             item.state = State.READY  # can be tried again
             if self._cancelling:
                 self._set_bar(item, "Cancelled")
             else:
-                self._set_bar(item, "Failed", tip=running.error or "yt-dlp stopped unexpectedly", state="failed")
+                self._set_bar(item, "Failed", None, "failed", running.error or "yt-dlp stopped unexpectedly")
         self._pump_downloads()
 
     def cancel_downloads(self) -> None:
@@ -1068,7 +1229,7 @@ class MainWindow(QMainWindow):
         done = sum(item.state is State.DONE for item in self._batch)
         speed = self._meter.speed()
 
-        self.overall.setValue(int(received * 1000 / total) if total else 0)
+        self.overall.set_progress(received / total if total else 0.0)
         parts = [f"{done} of {len(self._batch)} done", f"{human_size(received)} of {human_size(total)}"]
         if speed:
             parts.append(f"{human_size(speed)}/s")
@@ -1086,7 +1247,9 @@ class MainWindow(QMainWindow):
         if received >= MIN_BYTES_FOR_SPEED and elapsed > 0 and not cancelled:
             self.settings.setValue("last_speed", received / elapsed)
         if done == len(batch):
-            self.overall.setValue(self.overall.maximum())
+            self.overall.set_progress(1.0, "done")
+        else:
+            self.overall.set_progress(None, "idle")
 
         outcome = "Cancelled" if cancelled else "Finished"
         took = human_eta(elapsed).removeprefix("about ")
@@ -1102,8 +1265,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._downloads:
-            answer = QMessageBox.question(self, "ytgrab", "Downloads are still running. Stop them and quit?")
-            if answer != QMessageBox.StandardButton.Yes:
+            stop = dialogs.ask(
+                self,
+                "Stop the downloads?",
+                "Downloads are still running. What has arrived so far is kept, so they can be resumed later.",
+                confirm="Stop and quit",
+                cancel="Keep downloading",
+            )
+            if not stop:
                 event.ignore()
                 return
         self._generation += 1
@@ -1151,11 +1320,11 @@ def main(argv: list[str] | None = None) -> None:
     app = QApplication([sys.argv[0], *qt_arguments])
     app.setApplicationName("ytgrab")
     app.setDesktopFileName("ytgrab")  # Linux: ties the window to its launcher, so the dock shows the right icon
-    if theme.ICON_PATH.exists():
-        app.setWindowIcon(QIcon(str(theme.ICON_PATH)))
-    theme.apply(app)
-    app.styleHints().colorSchemeChanged.connect(lambda _scheme: theme.apply(app))
-    window = MainWindow()
+    icon = personal_icon() or theme.ICON_PATH
+    if icon.exists():
+        app.setWindowIcon(QIcon(str(icon)))
+    window = MainWindow()  # loads the fonts and applies the saved theme
+    app.styleHints().colorSchemeChanged.connect(lambda _scheme: window.follow_system())
     window.show()
     sys.exit(app.exec())
 
