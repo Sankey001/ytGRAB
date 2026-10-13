@@ -15,7 +15,26 @@ PROGRESS_TEMPLATE = (
     "|%(progress.total_bytes_estimate)s|%(progress.speed)s"
 )
 
-FRAGMENTS_IN_PARALLEL = "8"
+# YouTube limits the speed of each connection, so a video's speed grows with the
+# number of fragments fetched in parallel, until the line itself is full. Measured
+# on one lecture: 8 fragments gave 2.5 MiB/s, 16 gave 4.9 and 32 gave 6.0, the
+# line's limit. The budget below is shared out between the videos running at once.
+CONNECTION_BUDGET = 40
+MAX_FRAGMENTS = 32
+MIN_FRAGMENTS = 6
+
+# Parts of a lookup's answer that a download never reads; dropping them and the
+# unused formats turns about 1 MB of JSON per video into a few kilobytes.
+_UNNEEDED_INFO = (
+    "automatic_captions",
+    "subtitles",
+    "thumbnails",
+    "heatmap",
+    "requested_formats",
+    "requested_downloads",
+    "requested_subtitles",
+)
+
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.IGNORECASE)
 
@@ -44,13 +63,33 @@ def info_cmd(url: str) -> list[str]:
     return [*_base(), "--dump-single-json", "--no-playlist", url]
 
 
-def download_cmd(url: str, format_spec: str, output_template: str) -> list[str]:
+def fragments_for(videos_at_once: int) -> int:
+    """How many fragments one video may fetch in parallel when this many videos share the line."""
+    return max(MIN_FRAGMENTS, min(MAX_FRAGMENTS, CONNECTION_BUDGET // max(1, videos_at_once)))
+
+
+def slim_info(info: dict, format_specs: list[str]) -> dict:
+    """A lookup's answer cut down to what downloading any of `format_specs` needs.
+
+    Saved and handed back to yt-dlp with --load-info-json, it lets the download
+    start without looking the video up a second time.
+    """
+    wanted = {part for spec in format_specs for part in spec.split("+")}
+    slim = {key: value for key, value in info.items() if key not in _UNNEEDED_INFO}
+    slim["formats"] = [fmt for fmt in info.get("formats") or [] if str(fmt.get("format_id")) in wanted]
+    return slim
+
+
+def download_cmd(
+    url: str, format_spec: str, output_template: str, fragments: int = 8, info_file: str | None = None
+) -> list[str]:
+    """The download command. With `info_file` (see `slim_info`), yt-dlp reads that instead of asking the site again."""
     ffmpeg = tools.ffmpeg_path()
     return [
         *_base(),
         *(["--ffmpeg-location", ffmpeg] if ffmpeg else []),
         "--format", format_spec,
-        "--concurrent-fragments", FRAGMENTS_IN_PARALLEL,
+        "--concurrent-fragments", str(fragments),
         "--merge-output-format", "mp4",
         "--windows-filenames",  # names that are valid on every filesystem, NTFS and exFAT included
         "--no-playlist",
@@ -59,7 +98,7 @@ def download_cmd(url: str, format_spec: str, output_template: str) -> list[str]:
         "--newline",
         "--progress-template", PROGRESS_TEMPLATE,
         "--output", output_template,
-        url,
+        *(["--load-info-json", info_file] if info_file else [url]),
     ]  # fmt: skip
 
 
